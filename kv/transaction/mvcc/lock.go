@@ -80,9 +80,9 @@ func AllLocksForTxn(txn *MvccTxn) ([]KlPair, error) {
 	iter := txn.Reader.IterCF(engine_util.CfLock)
 	defer iter.Close()
 
-	for ; iter.Valid(); iter.Next() {
+	for iter.Seek([]byte{}); iter.Valid(); iter.Next() {
 		item := iter.Item()
-		val, err := item.Value()
+		val, err := item.ValueCopy(nil)
 		if err != nil {
 			return nil, err
 		}
@@ -91,7 +91,7 @@ func AllLocksForTxn(txn *MvccTxn) ([]KlPair, error) {
 			return nil, err
 		}
 		if lock.Ts == txn.StartTS {
-			result = append(result, KlPair{item.Key(), lock})
+			result = append(result, KlPair{item.KeyCopy(nil), lock})
 		}
 	}
 	return result, nil

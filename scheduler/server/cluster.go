@@ -278,8 +278,51 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
-	// Your Code Here (3C).
+	if region == nil || region.GetRegionEpoch() == nil {
+		return errors.New("missing region or region epoch")
+	}
 
+	c.Lock()
+	defer c.Unlock()
+
+	incomingEpoch := region.GetRegionEpoch()
+	affectedStores := make(map[uint64]struct{})
+	for id := range region.GetStoreIds() {
+		affectedStores[id] = struct{}{}
+	}
+	if origin := c.core.GetRegion(region.GetID()); origin != nil {
+		originEpoch := origin.GetRegionEpoch()
+		if incomingEpoch.GetVersion() < originEpoch.GetVersion() ||
+			incomingEpoch.GetConfVer() < originEpoch.GetConfVer() {
+			return ErrRegionIsStale(region.GetMeta(), origin.GetMeta())
+		}
+		for id := range origin.GetStoreIds() {
+			affectedStores[id] = struct{}{}
+		}
+	}
+	for _, overlap := range c.core.GetOverlaps(region) {
+		if overlap.GetID() == region.GetID() {
+			continue
+		}
+		overlapEpoch := overlap.GetRegionEpoch()
+		if incomingEpoch.GetVersion() < overlapEpoch.GetVersion() ||
+			incomingEpoch.GetConfVer() < overlapEpoch.GetConfVer() {
+			return ErrRegionIsStale(region.GetMeta(), overlap.GetMeta())
+		}
+		for id := range overlap.GetStoreIds() {
+			affectedStores[id] = struct{}{}
+		}
+	}
+
+	removed := c.core.PutRegion(region)
+	for _, oldRegion := range removed {
+		for id := range oldRegion.GetStoreIds() {
+			affectedStores[id] = struct{}{}
+		}
+	}
+	for id := range affectedStores {
+		c.updateStoreStatusLocked(id)
+	}
 	return nil
 }
 

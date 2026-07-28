@@ -307,7 +307,24 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	previousLastIndex := ps.raftState.LastIndex
+	for i := range entries {
+		entry := &entries[i]
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), entry); err != nil {
+			return err
+		}
+	}
+
+	lastEntry := entries[len(entries)-1]
+	for index := lastEntry.Index + 1; index <= previousLastIndex; index++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, index))
+	}
+	ps.raftState.LastIndex = lastEntry.Index
+	ps.raftState.LastTerm = lastEntry.Term
 	return nil
 }
 
@@ -319,19 +336,100 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	if snapshot.Metadata == nil || snapData.Region == nil {
+		return nil, errors.New("invalid raft snapshot")
+	}
+	previousRegion := ps.region
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	hardState := ps.raftState.HardState
+	if hardState == nil {
+		hardState = new(eraftpb.HardState)
+	}
+	if hardState.Term < snapshot.Metadata.Term {
+		hardState.Term = snapshot.Metadata.Term
+		hardState.Vote = 0
+	}
+	hardState.Commit = snapshot.Metadata.Index
+	ps.raftState = &rspb.RaftLocalState{
+		HardState: hardState,
+		LastIndex: snapshot.Metadata.Index,
+		LastTerm:  snapshot.Metadata.Term,
+	}
+	ps.applyState = &rspb.RaftApplyState{
+		AppliedIndex: snapshot.Metadata.Index,
+		TruncatedState: &rspb.RaftTruncatedState{
+			Index: snapshot.Metadata.Index,
+			Term:  snapshot.Metadata.Term,
+		},
+	}
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	if err := kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+	if err := raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+
+	notifier := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: snapData.Region.Id,
+		Notifier: notifier,
+		SnapMeta: snapshot.Metadata,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+	}
+	if applied := <-notifier; !applied {
+		ps.snapState.StateType = snap.SnapState_Relax
+		return nil, errors.New("failed to apply snapshot")
+	}
+	ps.snapState.StateType = snap.SnapState_Relax
+
+	return &ApplySnapResult{PrevRegion: previousRegion, Region: snapData.Region}, nil
 }
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+	var applySnapResult *ApplySnapResult
+	var err error
+
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err = ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+	if !raft.IsEmptyHardState(ready.HardState) {
+		hardState := ready.HardState
+		ps.raftState.HardState = &hardState
+	}
+	if err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+
+	// Snapshot application modifies the KV state machine before raft metadata
+	// is made durable. This ordering prevents a restart from observing raft
+	// progress whose state-machine data has not been installed yet.
+	if err = kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+	if err = raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+	return applySnapResult, nil
 }
 
 func (ps *PeerStorage) ClearData() {

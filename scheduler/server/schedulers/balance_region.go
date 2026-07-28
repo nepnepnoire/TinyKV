@@ -14,6 +14,9 @@
 package schedulers
 
 import (
+	"fmt"
+	"sort"
+
 	"github.com/pingcap-incubator/tinykv/scheduler/server/core"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule"
 	"github.com/pingcap-incubator/tinykv/scheduler/server/schedule/operator"
@@ -76,7 +79,89 @@ func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
 }
 
 func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) *operator.Operator {
-	// Your Code Here (3C).
+	stores := make([]*core.StoreInfo, 0)
+	for _, store := range cluster.GetStores() {
+		if store.IsUp() && store.DownTime() < cluster.GetMaxStoreDownTime() {
+			stores = append(stores, store)
+		}
+	}
+	sort.Slice(stores, func(i, j int) bool {
+		return stores[i].GetRegionSize() > stores[j].GetRegionSize()
+	})
+
+	for _, source := range stores {
+		for retry := 0; retry < balanceRegionRetryLimit; retry++ {
+			region := selectRegionForBalance(cluster, source.GetID())
+			if region == nil {
+				break
+			}
+			if len(region.GetStoreIds()) < cluster.GetMaxReplicas() {
+				continue
+			}
+
+			var target *core.StoreInfo
+			regionStores := region.GetStoreIds()
+			for i := len(stores) - 1; i >= 0; i-- {
+				candidate := stores[i]
+				if candidate.GetRegionSize() >= source.GetRegionSize() {
+					continue
+				}
+				if _, exists := regionStores[candidate.GetID()]; exists {
+					continue
+				}
+				target = candidate
+				break
+			}
+			if target == nil {
+				continue
+			}
+			if source.GetRegionSize()-target.GetRegionSize() < 2*region.GetApproximateSize() {
+				continue
+			}
+
+			newPeer, err := cluster.AllocPeer(target.GetID())
+			if err != nil {
+				return nil
+			}
+			op, err := operator.CreateMovePeerOperator(
+				fmt.Sprintf(
+					"balance region %d from store %d to store %d",
+					region.GetID(),
+					source.GetID(),
+					target.GetID(),
+				),
+				cluster,
+				region,
+				operator.OpBalance,
+				source.GetID(),
+				target.GetID(),
+				newPeer.GetId(),
+			)
+			if err == nil {
+				return op
+			}
+		}
+	}
 
 	return nil
+}
+
+func selectRegionForBalance(cluster opt.Cluster, storeID uint64) *core.RegionInfo {
+	var region *core.RegionInfo
+	cluster.GetPendingRegionsWithLock(storeID, func(regions core.RegionsContainer) {
+		region = regions.RandomRegion(nil, nil)
+	})
+	if region != nil {
+		return region
+	}
+	cluster.GetFollowersWithLock(storeID, func(regions core.RegionsContainer) {
+		region = regions.RandomRegion(nil, nil)
+	})
+	if region != nil {
+		return region
+	}
+	cluster.GetLeadersWithLock(storeID, func(regions core.RegionsContainer) {
+		region = regions.RandomRegion(nil, nil)
+	})
+	return region
 }

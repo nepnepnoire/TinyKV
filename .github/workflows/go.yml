@@ -1,26 +1,84 @@
-name: Go
+name: TinyKV CI
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    name: Build & Test
+  static-checks:
+    name: Build / Format / Vet
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Check out code
         uses: actions/checkout@v6
 
-      - name: Set up Go 1.13
+      - name: Set up Go 1.19
         uses: actions/setup-go@v6
         with:
-          go-version: '1.13.15'
-          cache: false
+          go-version: '1.19.x'
+          cache: true
 
       - name: Display Go version
         run: go version
 
-      - name: Build & Test
+      - name: Build, format check and vet
         run: make ci
+
+  visible-tests:
+    name: Full repository tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go 1.19
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.19.x'
+          cache: true
+
+      - name: Display Go version
+        run: go version
+
+      # Do NOT use `make project2` / `make project3` as the final CI gate:
+      # several raftstore targets in the Makefile append `|| true`, which can
+      # hide a failing test. `make test` runs the repository test packages
+      # directly and propagates failures to GitHub Actions.
+      - name: Run all visible tests
+        env:
+          TZ: Asia/Shanghai
+          LOG_LEVEL: fatal
+        run: make test
+
+  # Official TinyKV Classroom autograding entry. The repository-provided
+  # scripts/classroom.yml uses the same self-hosted runner and autograding
+  # action. Hidden tests are only available when the repository is attached
+  # to the corresponding Classroom / PingCAP grading infrastructure.
+  autograding:
+    name: Official autograding / hidden tests
+    if: github.event_name == 'push'
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Set up grading Go toolchain
+        uses: PingCAP-QE/setup-go@pingcap
+        with:
+          go-version: 1.19
+
+      - name: Run official autograder
+        uses: you06/autograding@go
